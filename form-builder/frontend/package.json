@@ -1,0 +1,25 @@
+{
+  "name": "form-builder-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@rjsf/core": "^5.18.0",
+    "@rjsf/utils": "^5.18.0",
+    "@rjsf/validator-ajv8": "^5.18.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1",
+    "deep-diff": "^1.0.2"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build"
+  },
+  "browserslist": {
+    "production": [">0.2%", "not dead", "not op_mini all"],
+    "development": ["last 1 chrome version", "last 1 firefox version", "last 1 safari version"]
+  },
+  "eslintConfig": {
+    "extends": ["react-app"]
+  }
+}
