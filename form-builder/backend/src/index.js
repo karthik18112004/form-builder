@@ -4,7 +4,7 @@ const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const Ajv = require('ajv');
 const addFormats = require('ajv-formats');
-const Anthropic = require('@anthropic-ai/sdk');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 const PORT = process.env.API_PORT || 8080;
@@ -12,19 +12,26 @@ const PORT = process.env.API_PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
+
 // In-memory conversation store
+
 const conversations = new Map();
 
-// AJV for JSON Schema validation
+
+// AJV JSON Schema Validation
+
 const ajv = new Ajv({ strict: false, allErrors: true });
 addFormats(ajv);
 
-// Anthropic client
-const anthropic = new Anthropic({
-  apiKey: process.env.LLM_API_KEY || 'dummy-key',
-});
 
-// ─── SYSTEM PROMPT ───────────────────────────────────────────────────────────
+// Gemini Client
+
+const genAI = new GoogleGenerativeAI(process.env.LLM_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+
+// SYSTEM PROMPT
+
 const SYSTEM_PROMPT = `You are an expert form builder assistant. Your job is to generate JSON Schema (Draft 7) objects that describe web forms based on user requirements.
 
 CRITICAL RULES:
@@ -52,7 +59,7 @@ RESPONSE FORMAT A - Form Schema (when request is clear):
   }
 }
 
-RESPONSE FORMAT B - Clarification needed (when request is ambiguous):
+RESPONSE FORMAT B - Clarification needed:
 {
   "type": "clarification",
   "questions": [
@@ -62,71 +69,94 @@ RESPONSE FORMAT B - Clarification needed (when request is ambiguous):
 }
 
 IMPORTANT SCHEMA RULES:
-- Use proper JSON Schema Draft 7 types: "string", "number", "integer", "boolean", "array", "object"
-- For select/dropdown fields, use "enum" array
-- For email fields, use "format": "email"
-- For date fields, use "format": "date"
-- For conditional fields, use custom property "x-show-when": { "field": "otherFieldName", "equals": value }
-- Always include "title" for human-readable labels
-- Infer validation rules (minLength, maxLength, minimum, maximum, pattern) from context
-- For boolean fields (checkboxes), use "type": "boolean"
+- Use JSON Schema Draft 7
 - Field names must be camelCase
+- Email → format: email
+- Date → format: date
+- Boolean → type: boolean
+- Dropdown → enum array
+- Conditional fields → "x-show-when": { "field": "...", "equals": value }
 
-AMBIGUOUS REQUESTS requiring clarification:
-- "booking a meeting room" - needs: what fields are required? date/time range? attendee count? room preferences?
-- "a form" - needs: what kind of form? what data to collect?
-- Very vague requests with no specific field information
+Only respond with JSON. No markdown or explanations.`;
 
-CLEAR REQUESTS that should generate schemas directly:
-- "contact form with name and email" - clear enough
-- "user signup with email and password" - clear enough
-- "survey about favorite colors" - clear enough
 
-When refining an existing form (conversation context provided), modify the existing schema by adding/removing/updating fields as requested. Keep existing fields unless told to remove them.
+// LLM CALL USING GEMINI
 
-Only respond with the JSON object, no markdown, no explanation text outside the JSON.`;
-
-// ─── LLM CALL ────────────────────────────────────────────────────────────────
 async function callLLM(messages, forceFail = false) {
+
   if (forceFail) {
-    return JSON.stringify({ invalid: 'this is not a valid response', broken: true });
+    return JSON.stringify({ invalid: "mock failure response" });
   }
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 4096,
-    system: SYSTEM_PROMPT,
-    messages: messages,
-  });
+  try {
 
-  return response.content[0].text;
+    const conversationText = messages
+      .map(m => `${m.role}: ${m.content}`)
+      .join("\n");
+
+    const prompt = `${SYSTEM_PROMPT}\n\n${conversationText}`;
+
+    const result = await model.generateContent(prompt);
+
+    const response = await result.response;
+    const text = response.text();
+
+    console.log("Gemini response:", text);
+
+    return text;
+
+  } catch (err) {
+
+    console.error("Gemini API error:", err);
+    throw err;
+
+  }
 }
 
-// ─── PARSE LLM RESPONSE ──────────────────────────────────────────────────────
+
+// PARSE LLM RESPONSE
+
 function parseLLMResponse(text) {
-  // Strip markdown code blocks if present
-  const cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+  const cleaned = text
+    .replace(/```json/g, '')
+    .replace(/```/g, '')
+    .trim();
+
   return JSON.parse(cleaned);
+
 }
 
-// ─── VALIDATE SCHEMA ─────────────────────────────────────────────────────────
+
+// BASIC SCHEMA VALIDATION
+
 function validateJsonSchema(schema) {
-  // Basic structural validation
-  if (!schema || typeof schema !== 'object') return { valid: false, errors: ['Schema must be an object'] };
-  if (schema.type !== 'object') return { valid: false, errors: ['Schema type must be "object"'] };
-  if (!schema.properties || typeof schema.properties !== 'object') {
+
+  if (!schema || typeof schema !== 'object')
+    return { valid: false, errors: ['Schema must be an object'] };
+
+  if (schema.type !== 'object')
+    return { valid: false, errors: ['Schema type must be "object"'] };
+
+  if (!schema.properties || typeof schema.properties !== 'object')
     return { valid: false, errors: ['Schema must have a properties object'] };
-  }
+
   return { valid: true, errors: [] };
+
 }
 
-// ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
+
+// HEALTH ENDPOINT
+
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy' });
 });
 
-// ─── MAIN FORM GENERATION ENDPOINT ──────────────────────────────────────────
+
+// FORM GENERATION ENDPOINT
+
 app.post('/api/form/generate', async (req, res) => {
+
   const { prompt, conversationId } = req.body;
   const mockFailureCount = parseInt(req.query.mock_llm_failure || '0');
 
@@ -134,15 +164,18 @@ app.post('/api/form/generate', async (req, res) => {
     return res.status(400).json({ error: 'Prompt is required' });
   }
 
-  // Get or create conversation
   let conversation;
   let currentConversationId;
 
   if (conversationId && conversations.has(conversationId)) {
+
     conversation = conversations.get(conversationId);
     currentConversationId = conversationId;
+
   } else {
+
     currentConversationId = uuidv4();
+
     conversation = {
       id: currentConversationId,
       messages: [],
@@ -150,52 +183,69 @@ app.post('/api/form/generate', async (req, res) => {
       version: 0,
       formId: uuidv4(),
     };
+
     conversations.set(currentConversationId, conversation);
+
   }
 
-  // Build messages for LLM
   const llmMessages = [...conversation.messages];
 
-  // If we have an existing schema, include context
   let userMessage = prompt;
+
   if (conversation.currentSchema) {
-    userMessage = `Current form schema:\n${JSON.stringify(conversation.currentSchema, null, 2)}\n\nUser request: ${prompt}`;
+
+    userMessage =
+      `Current form schema:\n${JSON.stringify(conversation.currentSchema, null, 2)}\n\nUser request: ${prompt}`;
+
   }
 
   llmMessages.push({ role: 'user', content: userMessage });
 
-  // Retry logic with mock failure support
   const MAX_RETRIES = 2;
+
   let lastError = null;
   let failuresLeft = mockFailureCount;
-  // Build a running message chain so each retry includes prior error context
   let retryMessages = [...llmMessages];
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+
     try {
+
       const shouldFail = failuresLeft > 0;
+
       if (shouldFail) failuresLeft--;
+
+      console.log(`LLM call attempt ${attempt + 1}${shouldFail ? ' (mock failure)' : ''}`);
 
       const rawResponse = await callLLM(retryMessages, shouldFail);
 
+      console.log("LLM raw response:", rawResponse);
+
       let parsed;
+
       try {
+
         parsed = parseLLMResponse(rawResponse);
+
       } catch (e) {
+
         lastError = `Invalid JSON: ${e.message}`;
-        // Accumulate error context for next retry
+
         retryMessages = [
           ...retryMessages,
-          { role: 'assistant', content: rawResponse || 'invalid response' },
-          { role: 'user', content: `Your previous attempt failed with this error: "${lastError}". Please respond with only a valid JSON object, no markdown.` },
+          { role: 'assistant', content: rawResponse },
+          { role: 'user', content: `Your previous response failed: ${lastError}. Return only valid JSON.` }
         ];
+
         continue;
+
       }
 
-      // Handle clarification response
       if (parsed.type === 'clarification') {
+
         conversation.messages.push({ role: 'user', content: prompt });
         conversation.messages.push({ role: 'assistant', content: rawResponse });
+
         conversations.set(currentConversationId, conversation);
 
         return res.json({
@@ -203,27 +253,33 @@ app.post('/api/form/generate', async (req, res) => {
           conversationId: currentConversationId,
           questions: parsed.questions,
         });
+
       }
 
-      // Handle schema response
       if (parsed.type === 'schema' && parsed.schema) {
+
         const validation = validateJsonSchema(parsed.schema);
+
         if (!validation.valid) {
+
           lastError = validation.errors.join(', ');
-          // Accumulate validation error context for next retry
+
           retryMessages = [
             ...retryMessages,
             { role: 'assistant', content: rawResponse },
-            { role: 'user', content: `Your previous schema failed validation with this error: "${lastError}". Please correct the schema structure.` },
+            { role: 'user', content: `Schema validation failed: ${lastError}. Fix schema.` }
           ];
+
           continue;
+
         }
 
-        // Success! Update conversation
         conversation.messages.push({ role: 'user', content: userMessage });
         conversation.messages.push({ role: 'assistant', content: rawResponse });
+
         conversation.currentSchema = parsed.schema;
         conversation.version += 1;
+
         conversations.set(currentConversationId, conversation);
 
         return res.json({
@@ -232,27 +288,29 @@ app.post('/api/form/generate', async (req, res) => {
           version: conversation.version,
           schema: parsed.schema,
         });
+
       }
 
-      lastError = 'Unexpected response format from LLM';
-      retryMessages = [
-        ...retryMessages,
-        { role: 'assistant', content: JSON.stringify(parsed) },
-        { role: 'user', content: `Your response was not in the expected format. Please respond with either format A (schema) or format B (clarification) as specified.` },
-      ];
+      lastError = "Unexpected response format";
+
     } catch (err) {
+
       lastError = err.message;
+
     }
+
   }
 
-  // All retries failed
   return res.status(500).json({
-    error: 'Failed to generate valid schema after multiple attempts.',
+    error: "Failed to generate valid schema after multiple attempts.",
     details: lastError,
   });
+
 });
 
-// ─── START SERVER ─────────────────────────────────────────────────────────────
+
+// START SERVER
+
 app.listen(PORT, () => {
   console.log(`Form Builder Backend running on port ${PORT}`);
 });
